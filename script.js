@@ -16,6 +16,7 @@ const hz = (v) => (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : Math.round(v) + 'hz
 const sec = (v) => (v >= 1 ? v.toFixed(1) + 's' : Math.round(v * 1000) + 'ms')
 const pct = (v) => Math.round(v * 100) + '%'
 
+// `value` is the default; each synth keeps its own copy of the values
 const PARAMS = [
   { key: 'detune', name: 'DETUNE', min: 0, max: 60, value: 24, fmt: (v) => Math.round(v) + 'ct' },
   { key: 'drive', name: 'DRIVE', min: 0, max: 1, value: 0.65, fmt: pct },
@@ -31,16 +32,15 @@ const PARAMS = [
   { key: 'room', name: 'ROOM', min: 0, max: 1, value: 0.18, fmt: pct },
   { key: 'volume', name: 'VOLUME', min: -36, max: 0, value: -8, fmt: (v) => Math.round(v) + 'db' }
 ]
-PARAMS.forEach((p) => (p.initial = p.value))
 // volume is a fader in the osc bar, everything else is a knob
 const KNOBS = PARAMS.filter((p) => p.key !== 'volume')
 
-const state = {
-  osc: 0,
-  octave: 2,
-  held: new Map()
-}
+// every synth has its own sound, octave and pattern; the transport is shared
+const synths = []
+// the synth scrolled into view, it gets the computer keyboard
+let active = 0
 
+// master bus + the sequencer loop, built on the first user gesture
 let audio = null
 const ui = {}
 
@@ -50,17 +50,31 @@ function noteName(midi) {
   return NOTE_NAMES[midi % 12] + (Math.floor(midi / 12) - 1)
 }
 
-function baseMidi() {
-  return (state.octave + 1) * 12
+function baseMidi(s) {
+  return (s.octave + 1) * 12
+}
+
+function createSynth(notes = []) {
+  return {
+    values: Object.fromEntries(PARAMS.map((p) => [p.key, p.value])),
+    osc: 0,
+    octave: 2,
+    held: new Map(),
+    notes,
+    hover: null,
+    drag: null,
+    audio: null,
+    ui: {}
+  }
 }
 
 // ---------- audio
 
-function makeSynth() {
-  const p = paramValues()
+function makeSynth(s) {
+  const p = s.values
   const synth = new Tone.PolySynth(Tone.MonoSynth, {
     maxPolyphony: 12,
-    oscillator: { ...OSCS[state.osc].oscillator, spread: p.detune },
+    oscillator: { ...OSCS[s.osc].oscillator, spread: p.detune },
     envelope: { attack: p.attack, decay: 0.2, sustain: 0.6, release: p.release },
     filter: { type: 'lowpass', rolloff: -24, Q: p.res },
     filterEnvelope: {
@@ -76,9 +90,19 @@ function makeSynth() {
   return synth
 }
 
-function buildAudio() {
-  const p = paramValues()
-  const synth = makeSynth()
+function buildMaster() {
+  // several synths summed can clip, the limiter keeps the sum in range
+  const master = new Tone.Limiter(-1)
+  const meter = new Tone.Meter({ normalRange: true, smoothing: 0.85 })
+  master.connect(meter)
+  master.toDestination()
+  const loop = new Tone.Loop(rollTick, '16n').start(0)
+  return { master, meter, loop }
+}
+
+function buildSynthAudio(s) {
+  const p = s.values
+  const synth = makeSynth(s)
 
   // dirt
   const dist = new Tone.Distortion({ distortion: p.drive, oversample: '2x' })
@@ -95,11 +119,9 @@ function buildAudio() {
   const vol = new Tone.Volume(p.volume)
 
   const scope = new Tone.Waveform(512)
-  const meter = new Tone.Meter({ normalRange: true, smoothing: 0.85 })
 
   synth.chain(dist, crush, wow, tapeLow, tapeHigh, comp, room, vol)
-  vol.fan(scope, meter)
-  vol.toDestination()
+  vol.fan(scope, audio.master)
 
   // hiss has its own path so the background meter stays white in silence
   const noise = new Tone.Noise('pink')
@@ -108,9 +130,18 @@ function buildAudio() {
   noise.chain(hiss, hissVol, Tone.getDestination())
   noise.start()
 
-  const loop = new Tone.Loop(rollTick, '16n').start(0)
+  const nodes = [dist, crush, wow, tapeLow, tapeHigh, comp, room, vol, scope, noise, hiss, hissVol]
+  return { synth, dist, crush, wow, tapeLow, room, vol, hiss, hissVol, noise, scope, nodes }
+}
 
-  return { synth, dist, crush, wow, tapeLow, room, vol, hiss, hissVol, scope, meter, loop }
+// lets the release tails ring out before tearing the chain down
+function disposeSynthAudio(s) {
+  const a = s.audio
+  if (!a) return
+  s.audio = null
+  a.synth.releaseAll()
+  a.noise.stop()
+  setTimeout(() => [a.synth, ...a.nodes].forEach((n) => n.dispose()), (s.values.release + 1) * 1000)
 }
 
 function crushCurve(bits) {
@@ -126,15 +157,16 @@ function hissDb(v) {
   return v <= 0 ? -Infinity : -52 + v * 30
 }
 
-function applyParam(key, v) {
-  if (!audio) return
-  const { synth } = audio
+function applyParam(s, key, v) {
+  const a = s.audio
+  if (!a) return
+  const { synth } = a
   switch (key) {
     case 'drive':
-      audio.dist.distortion = v
+      a.dist.distortion = v
       break
     case 'crush':
-      audio.crush.curve = crushCurve(v)
+      a.crush.curve = crushCurve(v)
       break
     case 'cutoff':
       synth.set({ filterEnvelope: { baseFrequency: v } })
@@ -155,58 +187,56 @@ function applyParam(key, v) {
       synth.set({ envelope: { release: v } })
       break
     case 'tape':
-      audio.tapeLow.frequency.rampTo(v, 0.05)
+      a.tapeLow.frequency.rampTo(v, 0.05)
       break
     case 'wow':
-      audio.wow.depth.value = v * 0.35
+      a.wow.depth.value = v * 0.35
       break
     case 'hiss':
-      audio.hiss.volume.value = hissDb(v)
+      a.hiss.volume.value = hissDb(v)
       break
     case 'room':
-      audio.room.wet.value = v
+      a.room.wet.value = v
       break
     case 'volume':
-      audio.vol.volume.rampTo(v, 0.05)
-      audio.hissVol.volume.rampTo(v, 0.05)
+      a.vol.volume.rampTo(v, 0.05)
+      a.hissVol.volume.rampTo(v, 0.05)
       break
   }
-}
-
-function paramValues() {
-  return Object.fromEntries(PARAMS.map((p) => [p.key, p.value]))
 }
 
 async function ensureAudio() {
   if (audio) return
   await Tone.start()
-  if (!audio) audio = buildAudio()
+  if (audio) return
+  audio = buildMaster()
+  synths.forEach((s) => (s.audio = buildSynthAudio(s)))
 }
 
 // a note can be held by several sources at once
-async function noteOn(midi, source) {
-  const holders = state.held.get(midi) || new Set()
+async function noteOn(s, midi, source) {
+  const holders = s.held.get(midi) || new Set()
   const fresh = holders.size === 0
   holders.add(source)
-  state.held.set(midi, holders)
+  s.held.set(midi, holders)
   await ensureAudio()
-  if (fresh && state.held.get(midi)?.has(source)) {
-    audio.synth.triggerAttack(noteName(midi), Tone.now(), 0.8)
+  if (fresh && s.held.get(midi)?.has(source)) {
+    s.audio?.synth.triggerAttack(noteName(midi), Tone.now(), 0.8)
   }
 }
 
-function noteOff(midi, source) {
-  const holders = state.held.get(midi)
+function noteOff(s, midi, source) {
+  const holders = s.held.get(midi)
   if (!holders || !holders.delete(source)) return
   if (holders.size === 0) {
-    state.held.delete(midi)
-    audio?.synth.triggerRelease(noteName(midi), Tone.now())
+    s.held.delete(midi)
+    s.audio?.synth.triggerRelease(noteName(midi), Tone.now())
   }
 }
 
-function releaseAll() {
-  state.held.clear()
-  audio?.synth.releaseAll()
+function releaseAll(s) {
+  s.held.clear()
+  s.audio?.synth.releaseAll()
 }
 
 // ---------- ascii layout helpers
@@ -270,6 +300,14 @@ function cell(parts, w, align = 'left') {
   return [...parts, txt(' '.repeat(free))]
 }
 
+// left parts flush left, right parts flush right
+function spread(left, right) {
+  left = norm(left)
+  right = norm(right)
+  const used = [...left, ...right].reduce((s, p) => s + p.w, 0)
+  return [...left, txt(' '.repeat(Math.max(0, INNER - used))), ...right]
+}
+
 function row(parts, align) {
   return line([ink('|'), ...cell(parts, INNER, align), ink('|')])
 }
@@ -292,39 +330,94 @@ function buildUI() {
   const app = document.getElementById('app')
   const add = (el) => app.appendChild(el)
 
-  // title + octave
-  ui.octave = slot(3, 'center', 'Bold')
+  // title + rack navigation
+  ui.rackPos = slot(5, 'center', 'Bold')
   add(border())
   add(
-    row([
-      ' ',
-      txt('ASYNTHCII', 'Bold Accent'),
-      txt(' :: DIRTY LO-FI SAW SYNTH', 'Muted'),
-      ' '.repeat(9),
-      'OCT ',
-      btn('(-)', () => shiftOctave(-1)),
-      ' [',
-      ui.octave,
-      '] ',
-      btn('(+)', () => shiftOctave(1))
-    ])
+    row(
+      spread(
+        [' ', txt('ASYNTHCII', 'Bold Accent'), txt(' :: DIRTY LO-FI SAW SYNTH', 'Muted')],
+        [
+          btn('(<)', () => goTo(active - 1)),
+          ' ',
+          ui.rackPos,
+          ' ',
+          btn('(>)', () => goTo(active + 1)),
+          ' ',
+          btn('(+ADD)', () => addSynth()),
+          ' '
+        ]
+      )
+    )
+  )
+
+  // transport, shared by every synth
+  ui.play = btn('(>)  PLAY ', togglePlay)
+  ui.bpm = slot(3, 'center', 'Bold')
+  ui.rollInfo = slot(17, 'right')
+  add(border())
+  add(
+    row(
+      spread(
+        [
+          ' ',
+          ui.play,
+          ' ',
+          btn('(|<)', rewind),
+          '   BPM ',
+          btn('(-)', (e) => setBpm(roll.bpm - (e.shiftKey ? 10 : 1))),
+          ' [',
+          ui.bpm,
+          '] ',
+          btn('(+)', (e) => setBpm(roll.bpm + (e.shiftKey ? 10 : 1)))
+        ],
+        [ui.rollInfo, ' ']
+      )
+    )
+  )
+  add(border())
+
+  // synths sit side by side and scroll horizontally, one screen each
+  ui.rack = document.createElement('div')
+  ui.rack.className = 'Rack'
+  ui.rack.addEventListener('scroll', updateActive, { passive: true })
+  add(ui.rack)
+}
+
+function buildSynthUI(s) {
+  const el = document.createElement('section')
+  el.className = 'Synth'
+  const add = (x) => el.appendChild(x)
+  const u = s.ui
+  u.el = el
+
+  // name + octave
+  u.name = slot(8, 'left', 'Bold Accent')
+  u.octave = slot(3, 'center', 'Bold')
+  add(
+    row(
+      spread(
+        [' ', u.name, '  ', btn('(CLR)', () => clearRoll(s)), ' ', btn('(DEL)', () => deleteSynth(s))],
+        ['OCT ', btn('(-)', () => shiftOctave(s, -1)), ' [', u.octave, '] ', btn('(+)', () => shiftOctave(s, 1)), ' ']
+      )
+    )
   )
 
   // oscillator selector + volume fader
-  ui.oscs = OSCS.map((o, i) => btn(`(${o.label})`, () => setOsc(i)))
+  u.oscs = OSCS.map((o, i) => btn(`(${o.label})`, () => setOsc(s, i)))
   const oscParts = [' ', txt('OSC', 'Bold'), ' : ']
-  ui.oscs.forEach((b) => oscParts.push(b, ' '))
-  ui.volumeBar = part(document.createElement('span'), 10)
-  ui.volume = slot(5, 'right')
-  oscParts.push(' '.repeat(3), txt('VOL', 'Bold'), ' ', ui.volumeBar, ' ', ui.volume)
+  u.oscs.forEach((b) => oscParts.push(b, ' '))
+  u.volumeBar = part(document.createElement('span'), 10)
+  u.volume = slot(5, 'right')
+  oscParts.push(' '.repeat(3), txt('VOL', 'Bold'), ' ', u.volumeBar, ' ', u.volume)
   add(border())
   add(row(oscParts))
-  fader(PARAMS.find((p) => p.key === 'volume'))
+  fader(s, PARAMS.find((p) => p.key === 'volume'))
 
   // knobs: 2 rows of 6
   add(border())
   for (let i = 0; i < KNOBS.length; i += 6) {
-    const group = KNOBS.slice(i, i + 6).map(knob)
+    const group = KNOBS.slice(i, i + 6).map((p) => knob(s, p))
     add(row([]))
     for (let r = 0; r < KNOB_H + 2; r++) {
       const parts = [' ']
@@ -335,44 +428,22 @@ function buildUI() {
   add(row([]))
 
   // scope
-  ui.scope = Array.from({ length: SCOPE_H }, () => slot(SCOPE_W, 'left', 'Accent'))
+  u.scope = Array.from({ length: SCOPE_H }, () => slot(SCOPE_W, 'left', 'Accent'))
   add(border())
-  ui.scope.forEach((s) => add(row([' ', s])))
-
-  // transport
-  ui.play = btn('(>)  PLAY ', togglePlay)
-  ui.bpm = slot(3, 'center', 'Bold')
-  ui.rollInfo = slot(17, 'right')
-  add(border())
-  add(
-    row([
-      ' ',
-      ui.play,
-      ' ',
-      btn('(|<)', rewind),
-      '   BPM ',
-      btn('(-)', (e) => setBpm(roll.bpm - (e.shiftKey ? 10 : 1))),
-      ' [',
-      ui.bpm,
-      '] ',
-      btn('(+)', (e) => setBpm(roll.bpm + (e.shiftKey ? 10 : 1))),
-      '   ',
-      btn('(CLR)', clearRoll),
-      ui.rollInfo
-    ])
-  )
+  u.scope.forEach((x) => add(row([' ', x])))
   add(border())
 
   // piano roll: note names hang in the left gutter, the grid keeps 64 columns
   const wrap = document.createElement('div')
   wrap.className = 'RollWrap'
-  ui.rollLabels = document.createElement('pre')
-  ui.rollLabels.className = 'RollLabels'
-  ui.roll = document.createElement('pre')
-  ui.roll.className = 'Roll'
-  wrap.append(ui.rollLabels, ui.roll)
+  u.rollLabels = document.createElement('pre')
+  u.rollLabels.className = 'RollLabels'
+  u.roll = document.createElement('pre')
+  u.roll.className = 'Roll'
+  wrap.append(u.rollLabels, u.roll)
   add(wrap)
-  bindRoll()
+  bindRoll(s)
+  return el
 }
 
 // ---------- knob
@@ -410,7 +481,7 @@ function pointerChar(deg) {
   return deg > 0 ? '/' : '\\'
 }
 
-function knob(p) {
+function knob(s, p) {
   const rows = Array.from({ length: KNOB_H }, () => {
     const span = document.createElement('span')
     span.className = 'Knob'
@@ -419,9 +490,10 @@ function knob(p) {
   const label = slot(KNOB_W, 'center', 'Bold Knob')
   const value = slot(KNOB_W, 'center', 'Muted')
   label.node.set(p.name)
+  const get = () => s.values[p.key]
 
   const paint = () => {
-    const n = clamp(toNorm(p, p.value), 0, 1)
+    const n = clamp(toNorm(p, get()), 0, 1)
     const grid = Array.from({ length: KNOB_H }, () => Array(KNOB_W).fill(null))
     const lit = Math.round(n * (RING.length - 1))
     RING.forEach(([x, y], i) => (grid[y][x] = i <= lit ? ['*', 'Accent Bold'] : ['.', 'Muted']))
@@ -436,12 +508,12 @@ function knob(p) {
     rows.forEach((span, y) => {
       span.innerHTML = grid[y].map((c) => (c ? `<span class="${c[1]}">${esc(c[0])}</span>` : ' ')).join('')
     })
-    value.node.set(p.fmt(p.value))
+    value.node.set(p.fmt(get()))
   }
 
   const set = (v) => {
-    p.value = v
-    applyParam(p.key, v)
+    s.values[p.key] = v
+    applyParam(s, p.key, v)
     paint()
   }
 
@@ -449,39 +521,41 @@ function knob(p) {
   for (const span of [...rows, label.node]) {
     span.addEventListener('pointerdown', (e) => {
       span.setPointerCapture(e.pointerId)
-      drag = { y: e.clientY, n: toNorm(p, p.value) }
+      drag = { y: e.clientY, n: toNorm(p, get()) }
     })
     span.addEventListener('pointermove', (e) => {
       if (drag && span.hasPointerCapture(e.pointerId)) set(fromNorm(p, drag.n + (drag.y - e.clientY) / 160))
     })
     span.addEventListener('pointerup', () => (drag = null))
-    span.addEventListener('dblclick', () => set(p.initial))
+    span.addEventListener('dblclick', () => set(p.value))
     span.addEventListener(
       'wheel',
       (e) => {
+        // horizontal swipes scroll the rack
+        if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return
         e.preventDefault()
-        set(fromNorm(p, toNorm(p, p.value) + (e.deltaY < 0 ? 1 : -1) / 40))
+        set(fromNorm(p, toNorm(p, get()) + (e.deltaY < 0 ? 1 : -1) / 40))
       },
       { passive: false }
     )
   }
 
   paint()
-  return { lines: [...rows.map((s) => part(s, KNOB_W)), label, value] }
+  return { lines: [...rows.map((x) => part(x, KNOB_W)), label, value] }
 }
 
 // horizontal ascii fader: [######..]
-function fader(p) {
-  const bar = ui.volumeBar.node
+function fader(s, p) {
+  const bar = s.ui.volumeBar.node
   bar.className = 'Fader'
   const paint = () => {
-    const n = Math.round(clamp(toNorm(p, p.value), 0, 1) * 8)
+    const n = Math.round(clamp(toNorm(p, s.values[p.key]), 0, 1) * 8)
     bar.innerHTML = `<span class="Ink">[</span><span class="Accent">${'#'.repeat(n)}</span><span class="Muted">${'.'.repeat(8 - n)}</span><span class="Ink">]</span>`
-    ui.volume.node.set(p.fmt(p.value))
+    s.ui.volume.node.set(p.fmt(s.values[p.key]))
   }
   const set = (v) => {
-    p.value = v
-    applyParam(p.key, v)
+    s.values[p.key] = v
+    applyParam(s, p.key, v)
     paint()
   }
   const fromEvent = (e) => {
@@ -496,57 +570,105 @@ function fader(p) {
   bar.addEventListener('pointermove', (e) => {
     if (bar.hasPointerCapture(e.pointerId)) fromEvent(e)
   })
-  bar.addEventListener('dblclick', () => set(p.initial))
+  bar.addEventListener('dblclick', () => set(p.value))
   paint()
 }
 
 // ---------- controls
 
-function setOsc(i) {
-  state.osc = i
-  if (audio) {
+function setOsc(s, i) {
+  s.osc = i
+  const a = s.audio
+  if (a) {
     // changing the wave type of a sounding OmniOscillator drops its scheduled stop,
     // so PolySynth never gets the voice back. swap in a fresh synth instead.
-    const old = audio.synth
-    audio.synth = makeSynth()
-    audio.synth.connect(audio.dist)
+    const old = a.synth
+    a.synth = makeSynth(s)
+    a.synth.connect(a.dist)
     old.releaseAll()
-    const release = PARAMS.find((p) => p.key === 'release').value
-    setTimeout(() => old.dispose(), (release + 1) * 1000)
+    setTimeout(() => old.dispose(), (s.values.release + 1) * 1000)
   }
-  renderHud()
+  renderSynth(s)
 }
 
-function shiftOctave(d) {
-  releaseAll()
-  state.octave = clamp(state.octave + d, 0, 7)
-  renderHud()
-}
-
-function renderHud() {
-  ui.octave.node.set('C' + state.octave)
-  ui.oscs.forEach((b, i) => b.node.classList.toggle('is-on', i === state.osc))
-  renderRoll()
+function shiftOctave(s, d) {
+  releaseAll(s)
+  s.octave = clamp(s.octave + d, 0, 7)
+  renderSynth(s)
   renderTransport()
+}
+
+function renderSynth(s) {
+  s.ui.name.node.set('SYNTH ' + (synths.indexOf(s) + 1))
+  s.ui.octave.node.set('C' + s.octave)
+  s.ui.oscs.forEach((b, i) => b.node.classList.toggle('is-on', i === s.osc))
+  renderRoll(s)
+}
+
+function renderAll() {
+  ui.rackPos.node.set(`${active + 1}/${synths.length}`)
+  synths.forEach(renderSynth)
+  renderTransport()
+}
+
+// ---------- rack
+
+function addSynth(notes = []) {
+  const s = createSynth(notes)
+  synths.push(s)
+  ui.rack.appendChild(buildSynthUI(s))
+  if (audio) s.audio = buildSynthAudio(s)
+  renderAll()
+  goTo(synths.length - 1)
+}
+
+function deleteSynth(s) {
+  if (synths.length === 1) return
+  releaseAll(s)
+  disposeSynthAudio(s)
+  synths.splice(synths.indexOf(s), 1)
+  s.ui.el.remove()
+  active = Math.min(active, synths.length - 1)
+  updateActive()
+  renderAll()
+}
+
+// scroll offset of a synth when it's snapped into view
+function rackOffset(i) {
+  return synths[i].ui.el.offsetLeft - synths[0].ui.el.offsetLeft
+}
+
+function goTo(i) {
+  i = clamp(i, 0, synths.length - 1)
+  ui.rack.scrollTo({ left: rackOffset(i), behavior: 'smooth' })
+}
+
+function updateActive() {
+  const x = ui.rack.scrollLeft
+  let best = 0
+  synths.forEach((_, i) => {
+    if (Math.abs(rackOffset(i) - x) < Math.abs(rackOffset(best) - x)) best = i
+  })
+  active = best
+  ui.rackPos.node.set(`${active + 1}/${synths.length}`)
 }
 
 // ---------- piano roll
 //
-// 64 sixteenth steps x 24 semitones from the current octave's C.
+// 64 sixteenth steps x 24 semitones from the synth's octave C.
 // notes are stored relative to that C, so OCT transposes the pattern.
 
 const STEPS = 64
 const ROWS = 24
 const BLACK_KEYS = [1, 3, 6, 8, 10]
+// cmd/ctrl + drag repeats a one-step note every REPEAT steps
+const REPEAT = 8
 
 const roll = {
-  notes: defaultPattern(),
   playing: false,
   bpm: 120,
   step: 0,
-  playCol: -1,
-  hover: null,
-  drag: null
+  playCol: -1
 }
 
 function defaultPattern() {
@@ -573,19 +695,24 @@ function defaultPattern() {
 
 const rowSemi = (r) => ROWS - 1 - r
 
-function noteAt(semi, col) {
-  return roll.notes.findIndex((n) => n.semi === semi && col >= n.start && col < n.start + n.len)
+function noteAt(s, semi, col) {
+  return s.notes.findIndex((n) => n.semi === semi && col >= n.start && col < n.start + n.len)
 }
 
 function rollTick(time) {
   const col = roll.step
   const step = Tone.Time('16n').toSeconds()
-  for (const n of roll.notes) {
-    if (n.start === col) audio.synth.triggerAttackRelease(noteName(baseMidi() + n.semi), n.len * step * 0.95, time, 0.8)
+  for (const s of synths) {
+    if (!s.audio) continue
+    for (const n of s.notes) {
+      if (n.start === col) {
+        s.audio.synth.triggerAttackRelease(noteName(baseMidi(s) + n.semi), n.len * step * 0.95, time, 0.8)
+      }
+    }
   }
   Tone.getDraw().schedule(() => {
     roll.playCol = col
-    renderRoll()
+    synths.forEach(renderRoll)
     renderTransport()
   }, time)
   roll.step = (col + 1) % STEPS
@@ -608,7 +735,7 @@ async function togglePlay() {
 function rewind() {
   roll.step = 0
   if (!roll.playing) roll.playCol = -1
-  renderRoll()
+  synths.forEach(renderRoll)
   renderTransport()
 }
 
@@ -618,9 +745,9 @@ function setBpm(v) {
   renderTransport()
 }
 
-function clearRoll() {
-  roll.notes = []
-  renderRoll()
+function clearRoll(s) {
+  s.notes = []
+  renderRoll(s)
 }
 
 function renderTransport() {
@@ -628,14 +755,15 @@ function renderTransport() {
   ui.play.node.classList.toggle('is-on', roll.playing)
   ui.bpm.node.set(String(roll.bpm))
   const pos = String(Math.max(roll.playCol, 0) + 1).padStart(2, '0') + '/' + STEPS
-  const h = roll.hover
-  ui.rollInfo.node.set(h ? `${noteName(baseMidi() + rowSemi(h.r))} @ ${h.c + 1}   ${pos}` : `STEP ${pos}`)
+  const s = synths.find((x) => x.hover)
+  const h = s?.hover
+  ui.rollInfo.node.set(h ? `${noteName(baseMidi(s) + rowSemi(h.r))} @ ${h.c + 1}   ${pos}` : `STEP ${pos}`)
 }
 
-function renderRoll() {
-  if (!ui.roll) return
+function renderRoll(s) {
+  const u = s.ui
   const owner = Array.from({ length: ROWS }, () => new Int16Array(STEPS).fill(-1))
-  roll.notes.forEach((n, k) => {
+  s.notes.forEach((n, k) => {
     const r = ROWS - 1 - n.semi
     if (r < 0 || r >= ROWS) return
     for (let c = n.start; c < Math.min(STEPS, n.start + n.len); c++) owner[r][c] = k
@@ -658,10 +786,10 @@ function renderRoll() {
       if (c === roll.playCol) cls = 'p'
       const k = owner[r][c]
       if (k >= 0) {
-        if (roll.notes[k].start === c) ch = '*'
+        if (s.notes[k].start === c) ch = '*'
         cls = c === roll.playCol ? 'h' : 'm'
       }
-      if (roll.hover && roll.hover.r === r && roll.hover.c === c) cls = 'c'
+      if (s.hover && s.hover.r === r && s.hover.c === c) cls = 'c'
       if (cls !== runCls) {
         flush()
         runCls = cls
@@ -671,53 +799,77 @@ function renderRoll() {
     flush()
     lines.push(html)
   }
-  ui.roll.innerHTML = lines.join('\n')
-  ui.rollLabels.innerHTML = Array.from({ length: ROWS }, (_, r) => {
-    const name = noteName(baseMidi() + rowSemi(r))
+  u.roll.innerHTML = lines.join('\n')
+  u.rollLabels.innerHTML = Array.from({ length: ROWS }, (_, r) => {
+    const name = noteName(baseMidi(s) + rowSemi(r))
     return rowSemi(r) % 12 === 0 ? `<span class="Bold">${name}</span>` : name
   }).join('\n')
 }
 
-function bindRoll() {
+function bindRoll(s) {
+  const el = s.ui.roll
   const cellAt = (e) => {
-    const rect = ui.roll.getBoundingClientRect()
+    const rect = el.getBoundingClientRect()
     return {
       r: clamp(Math.floor(((e.clientY - rect.top) / rect.height) * ROWS), 0, ROWS - 1),
       c: clamp(Math.floor(((e.clientX - rect.left) / rect.width) * STEPS), 0, STEPS - 1)
     }
   }
 
-  ui.roll.addEventListener('pointerdown', async (e) => {
-    ui.roll.setPointerCapture(e.pointerId)
+  const repeating = (e) => e.metaKey || e.ctrlKey
+
+  // replaces the notes from the current repeat drag with ones at every REPEAT steps up to col
+  const fillRepeat = (d, col) => {
+    s.notes = s.notes.filter((n) => !d.notes.includes(n))
+    const count = col > d.start ? Math.floor((col - d.start) / REPEAT) + 1 : 1
+    d.notes = []
+    for (let i = 0; i < count; i++) {
+      const start = d.start + i * REPEAT
+      if (noteAt(s, d.semi, start) < 0) d.notes.push({ start, semi: d.semi, len: 1 })
+    }
+    s.notes.push(...d.notes)
+  }
+
+  // ctrl+click opens the context menu on macOS
+  el.addEventListener('contextmenu', (e) => e.preventDefault())
+  el.addEventListener('pointerdown', async (e) => {
+    el.setPointerCapture(e.pointerId)
     const { r, c } = cellAt(e)
     const semi = rowSemi(r)
-    const k = noteAt(semi, c)
+    const k = noteAt(s, semi, c)
     if (k >= 0) {
-      roll.notes.splice(k, 1)
-      roll.drag = null
+      s.notes.splice(k, 1)
+      s.drag = null
     } else {
       const note = { start: c, semi, len: 1 }
-      // a note can grow until the next note on the same row
-      const next = roll.notes.filter((n) => n.semi === semi && n.start > c).map((n) => n.start)
-      roll.notes.push(note)
-      roll.drag = { note, limit: Math.min(STEPS, ...next) }
+      s.notes.push(note)
+      if (repeating(e)) {
+        s.drag = { repeat: true, start: c, semi, notes: [note] }
+      } else {
+        // a note can grow until the next note on the same row
+        const next = s.notes.filter((n) => n.semi === semi && n.start > c).map((n) => n.start)
+        s.drag = { note, limit: Math.min(STEPS, ...next) }
+      }
       await ensureAudio()
-      audio.synth.triggerAttackRelease(noteName(baseMidi() + semi), '16n', Tone.now(), 0.7)
+      s.audio?.synth.triggerAttackRelease(noteName(baseMidi(s) + semi), '16n', Tone.now(), 0.7)
     }
-    renderRoll()
+    renderRoll(s)
   })
-  ui.roll.addEventListener('pointermove', (e) => {
+  el.addEventListener('pointermove', (e) => {
     const { r, c } = cellAt(e)
-    roll.hover = { r, c }
-    const d = roll.drag
-    if (d && ui.roll.hasPointerCapture(e.pointerId)) d.note.len = clamp(c - d.note.start + 1, 1, d.limit - d.note.start)
-    renderRoll()
+    s.hover = { r, c }
+    const d = s.drag
+    if (d && el.hasPointerCapture(e.pointerId)) {
+      if (d.repeat) fillRepeat(d, c)
+      else d.note.len = clamp(c - d.note.start + 1, 1, d.limit - d.note.start)
+    }
+    renderRoll(s)
     renderTransport()
   })
-  ui.roll.addEventListener('pointerup', () => (roll.drag = null))
-  ui.roll.addEventListener('pointerleave', () => {
-    roll.hover = null
-    renderRoll()
+  el.addEventListener('pointerup', () => (s.drag = null))
+  el.addEventListener('pointerleave', () => {
+    s.hover = null
+    renderRoll(s)
     renderTransport()
   })
 }
@@ -728,9 +880,9 @@ const SCOPE_W = 60
 const SCOPE_H = 3
 const SCOPE_CHARS = ['_', '-', '`'] // bottom, middle, top of a character cell
 
-function renderScope() {
+function renderScope(s) {
   const lines = Array.from({ length: SCOPE_H }, () => Array(SCOPE_W).fill(' '))
-  const data = audio?.scope.getValue()
+  const data = s.audio?.scope.getValue()
   const levels = SCOPE_H * SCOPE_CHARS.length
 
   for (let x = 0; x < SCOPE_W; x++) {
@@ -738,10 +890,13 @@ function renderScope() {
     const l = clamp(Math.floor(((v + 1) / 2) * levels), 0, levels - 1)
     lines[SCOPE_H - 1 - Math.floor(l / SCOPE_CHARS.length)][x] = SCOPE_CHARS[l % SCOPE_CHARS.length]
   }
-  ui.scope.forEach((s, i) => s.node.set(lines[i].join('')))
+  s.ui.scope.forEach((x, i) => x.node.set(lines[i].join('')))
+}
 
+function renderFrame() {
+  synths.forEach(renderScope)
   renderBackground()
-  requestAnimationFrame(renderScope)
+  requestAnimationFrame(renderFrame)
 }
 
 // background is a level meter: white at silence, 50% accent at full scale
@@ -760,6 +915,7 @@ function renderBackground() {
 function onKey(e, down) {
   if (e.metaKey || e.ctrlKey || e.altKey) return
   const key = e.key.toLowerCase()
+  const s = synths[active]
 
   if (key === ' ') {
     e.preventDefault()
@@ -768,7 +924,7 @@ function onKey(e, down) {
   }
 
   if (down && !e.repeat && (key === 'z' || key === 'x')) {
-    shiftOctave(key === 'z' ? -1 : 1)
+    shiftOctave(s, key === 'z' ? -1 : 1)
     return
   }
   const semi = KEYMAP.indexOf(key)
@@ -778,18 +934,20 @@ function onKey(e, down) {
 
   const source = 'key:' + key
   if (down) {
-    noteOn(baseMidi() + semi, source)
+    noteOn(s, baseMidi(s) + semi, source)
   } else {
-    // the octave may have changed while the key was held
-    for (const [midi, holders] of state.held) if (holders.has(source)) noteOff(midi, source)
+    // the octave or the active synth may have changed while the key was held
+    for (const x of synths) {
+      for (const [midi, holders] of x.held) if (holders.has(source)) noteOff(x, midi, source)
+    }
   }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   buildUI()
-  renderHud()
-  renderScope()
+  addSynth(defaultPattern())
+  renderFrame()
   document.addEventListener('keydown', (e) => onKey(e, true))
   document.addEventListener('keyup', (e) => onKey(e, false))
-  window.addEventListener('blur', releaseAll)
+  window.addEventListener('blur', () => synths.forEach(releaseAll))
 })
